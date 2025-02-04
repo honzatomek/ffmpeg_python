@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+
+class version:
+    __author__  = "Jan Tomek <jan.tomek@protonmail.com>"
+    __version__ = "v1.0"
+    __date__    = "11.07.2024"
+    __source__  = "https://unix.stackexchange.com/questions/745238/how-to-merge-multiple-mp4-files-as-chapters-in-a-final-mp4"
+
+__doc__ = f"""Script to concatenate multiple *.mp4 file to one with chapters
+author:  {version.__author__:s}
+version: {version.__version__:s}
+date:    {version.__date__:s}
+source:  {version.__source__:s}
+"""
+
+import os
+import re
+import datetime
+import subprocess
+import argparse
+
+
+FFFILE = "file '{filename:s}'\n"
+FFPROBE  = "ffprobe -v quiet -of csv=p=0 -show_entries format=duration {file:s}"
+# FFCONCAT = "ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i {filelist:s} -i {metadatafile:s} -map_metadata 1 {combinedfile:s}"
+FFCONCAT = "ffmpeg -hide_banner -loglevel info -y -f concat -safe 0 -i {filelist:s} -i {metadatafile:s} -map_metadata 1 {combinedfile:s}"
+FFMETAHEADER = """;FFMETADATA1
+"""
+FFCHAPTER = """
+[CHAPTER]
+TIMEBASE=1/1000000
+START={start:d}
+END={end:d}
+title={title:s}
+"""
+
+
+class CheckFile(argparse.Action):
+    def __call__(self, parser, namespace, value, option_string=None):
+        vals = value if isinstance(value, (tuple, list)) else [value]
+        vals = [os.path.realpath(v) for v in vals]
+
+        msg = []
+
+        for i, v in enumerate(vals):
+            if not os.path.isfile(os.path.realpath(v)):
+                msg.append(f"File does not exist: {v:s}")
+                continue
+
+            basename, ext = os.path.splitext(v)
+            if ext.lower() != ".mp4":
+                msg.append(f"File is not *.mp4: {v:s}")
+                continue
+
+        if len(msg) > 0:
+            raise argparse.ArgumentError(self, "\n".join(msg))
+
+        setattr(namespace, self.dest, vals if isinstance(value, (tuple, list)) else vals[0])
+
+
+
+def make_chapters_metadata(list_mp4: list) -> (str, str):
+
+    if len(list_mp4) < 2:
+        raise ValueError(f"Two or more files need to be supplied, not {len(list_mp4):d}.")
+
+    list_mp4.sort()
+    basename = os.path.commonprefix(list_mp4)
+    filelist = basename + ".txt"
+
+    # Make the list of mp4 in ffmpeg format
+    print(f"[+] Making file list source file")
+    with open(filelist, "wt") as f:
+        for filename_mp4 in list_mp4:
+            f.write(FFFILE.format(filename=filename_mp4))
+
+    # create chapters metadata
+    print(f"[+] Making metadata source file")
+    chapters = {}
+    chapter_fmt = "{0:0" + str(len(str(len(list_mp4)))) + "d} - {1:s}"
+    time_start = 0
+    time_end = 0
+    for i, single_mp4 in enumerate(list_mp4):
+        duration_in_microseconds = int((subprocess.run(FFPROBE.format(file=single_mp4),
+                                                       shell=True,
+                                                       capture_output=True).stdout.decode().strip().replace(".", "")))
+        time_end += duration_in_microseconds
+        chapters[i] = {
+                       "name":     chapter_fmt.format(i+1, os.path.splitext(os.path.basename(single_mp4))[0]),
+                       "start":    int(time_start),
+                       "end":      int(time_end),
+                       "duration": duration_in_microseconds,
+                       }
+        time_start = time_end
+
+    t = datetime.datetime(year=1, month=1, day=1)
+    dt = datetime.timedelta(microseconds=time_end)
+
+    print(f"[+] Final duration should be ~ {(t + dt).strftime('%H:%M:%S')}")
+
+    metadatafile = basename + "_metadata.txt"
+    with open(metadatafile, "wt") as m:
+        m.write(FFMETAHEADER)
+        for i, chapter in chapters.items():
+            ch_meta = FFCHAPTER.format(title=chapter["name"], start=chapter["start"], end=chapter["end"])
+            m.writelines(ch_meta)
+
+    return filelist, metadatafile
+
+
+
+def concatenate_all_to_one_with_chapters(files_mp4: list, filelist: str, metadatafile: str) -> (int, str):
+    if not os.path.isfile(filelist):
+        raise ValueError(f"File with list of *.mp4 files to concatenate does not exist ({filelist:s}).")
+    if not os.path.isfile(metadatafile):
+        raise ValueError(f"File with metadata of chapters of *.mp4 files to concatenate does not exist ({metadatafile:s}).")
+
+    # combinedfile = os.path.splitext(filelist)[0] + "_concat.mp4"
+    combinedfile = os.path.splitext(files_mp4[0])[0] + "_concat.mp4"
+
+    print(f"[+] Concatenating list of mp4 to {combinedfile:s}")
+    retval = os.system(FFCONCAT.format(filelist=filelist, metadatafile=metadatafile, combinedfile=combinedfile))
+
+    return retval, combinedfile
+
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawTextHelpFormatter)
+
+    parser.add_argument("mp4", nargs="+", type=str, action=CheckFile,
+                        help="The *.mp4 files to concatenate.")
+
+    args = parser.parse_args()
+    if len(args.mp4) < 2:
+        print(f"[-] Two or more files need to be supplied, not {len(args.mp4):d}.")
+
+    filelist, filemeta   = make_chapters_metadata(args.mp4)
+    retval, fileconcat   = concatenate_all_to_one_with_chapters(args.mp4, filelist, filemeta)
+
+    # cleanup
+    if retval != 0:
+        print("[-] Something failed.")
+    else:
+        print(f"[+] Created {fileconcat:s}, cleaning up..")
+        for f in [filelist, filemeta]:
+            if os.path.isfile(f):
+                os.remove(f)
+        print(f"[+] Finished.")
+
